@@ -1,0 +1,753 @@
+---
+title: "Stock Price Forecasting Using 30-Second Time Bucket Intervals"
+format: html
+editor: visual
+---
+
+```{r}
+library(tidyverse)
+library(rugarch)
+library(ggplot2)
+library(gridExtra)
+library(xgboost)
+
+stock <- read.csv("C:/Users/Ame PC/Desktop/3rd year 1st sem/DATA 3888/Data/stock_1.csv")
+```
+
+#EDA
+```{r}
+colSums(is.na(stock))
+str(stock)
+head(stock)
+
+```
+#Compute Statistics 
+```{r}
+stock = stock%>%
+  mutate(WAP = (bid_price1 * ask_size1 + ask_price1 * bid_size1) / (bid_size1 + ask_size1), BidAskSpread = ask_price1 / bid_price1 - 1)
+
+head(stock)
+
+
+#log return
+
+Time_IDs = unique(stock$time_id)[1:500]
+
+log_r_stock <- list()
+
+for (i in 1:length(Time_IDs)) {
+  seconds = stock %>% filter(time_id == Time_IDs[i]) %>%
+    pull(seconds_in_bucket)
+  price = stock %>% filter(time_id == Time_IDs[i]) %>% 
+    pull(WAP)
+  log_r = log(price[-1] / price[1:length(price) - 1]) 
+  log_r_stock[[i]] = tibble(time = seconds[-1], log_return = log_r)
+  
+  no_diff <- (1:600)[!(1:600 %in% log_r_stock[[i]]$time)]
+  if (length(no_diff) >0){
+    no_diff_df = tibble(time = no_diff, log_return = 0)
+    log_r_stock[[i]] = log_r_stock[[i]] %>% 
+      bind_rows(no_diff_df) %>%
+      arrange(time)
+  }
+    
+    
+}
+
+head(log_r_stock[[1]])
+head(log_r_stock[[500]])
+
+
+vol = list()
+comp_vol <- function(x) sqrt(sum(x^2))
+
+for (i in 1:500) {
+  log_r_stock[[i]] = log_r_stock[[i]] %>% 
+    mutate(time_bucket = ceiling(time/30))
+  vol[[i]] = log_r_stock[[i]] %>% 
+    group_by(time_bucket) %>% 
+    summarise(volatility = comp_vol(log_return))
+}
+
+head(vol[[1]])
+```
+
+
+## ACF
+```{r}
+acf(log_r_stock[[1]]$log_return, main = "ACF graph for log returns")
+
+acf(vol[[1]]$volatility, main = "ACF graph for realised volatility")
+```
+
+
+# Model Building
+
+## Model 1
+```{r}
+#Weighted linear regression
+train_vol = list()
+valid_vol = list()
+
+for (i in 1:500) {
+  train_vol[[i]] = vol[[i]][1:16, ]
+  valid_vol[[i]] = vol[[i]][-(1:16), ]
+  
+  
+}
+
+
+predict = stock%>% 
+  mutate( num_order = bid_size1 + ask_size1 + bid_size2 + ask_size2, time_bucket = ceiling(seconds_in_bucket / 30)) %>% 
+  select(time_id, time_bucket, WAP, num_order, BidAskSpread)
+
+list_reg <- list()
+for (i in 1:500) {
+  list_reg[[i]] <- predict%>% 
+    filter(time_id == Time_IDs[i], time_bucket != 0) %>%
+    group_by(time_bucket) %>%
+    summarise(price = mean(WAP), 
+              order = mean(num_order), 
+              BidAskSpread = mean(BidAskSpread)) %>% 
+    slice(1:15) %>%  
+    mutate(volatility = train_vol[[i]]$volatility[-1])
+}
+weight_model =lm(volatility ~ price + order + BidAskSpread, data = list_reg[[1]], weights = 0.8 ^ seq(from = 7, to = 0, by = -0.5))
+
+summary(weight_model)
+  
+weight_models = list()
+for (i in 1:500){
+  weight_models[[i]] = lm(volatility ~ price + order + BidAskSpread, data = list_reg[[i]], weights = 0.8 ^ seq(from = 7, to = 0, by = -0.5))
+
+}
+
+summary(weight_models[[200]])
+
+
+#Prediction 
+val_list_reg <- list()
+predict_lm <- list()
+for (i in 1:500) { 
+  val_list_reg[[i]] = predict %>% 
+    filter(time_id == Time_IDs[i], time_bucket != 0) %>% 
+      group_by(time_bucket) %>% 
+    summarise(price = mean(WAP), order = mean(num_order), BidAskSpread = mean(BidAskSpread)) %>% 
+    slice(16:19)
+  
+  predict_lm[[i]] = predict(weight_models[[i]], newdata = val_list_reg[[i]])
+}
+
+predict_lm[[1]]
+
+print(data.frame(
+  actual    = valid_vol[[1]]$volatility,
+  predicted = predict_lm[[1]]
+))
+
+
+
+#summary of stats
+
+MSE_wlm <- numeric(500)
+QLIKE_wlm <- numeric(500)
+
+for (i in 1:500) { 
+  actual <- valid_vol[[i]]$volatility 
+  pred <- predict_lm[[i]]
+  pred[pred <= 0] <- 1e-10
+    
+  MSE_wlm[i] <- mean((actual - pred)^2)
+  QLIKE_wlm[i] <- mean(actual/pred - log(actual/pred) - 1)
+  
+}
+  
+  summary_wlm <- data.frame(
+    
+    Metrics_to_evaluate = c("MSE", "QLIKE"), 
+    Mean = c(mean(MSE_wlm, na.rm= TRUE), mean(QLIKE_wlm, na.rm = TRUE)),
+    Median = c(median(MSE_wlm, na.rm= TRUE), median(QLIKE_wlm, na.rm = TRUE)), 
+    SD = c(sd(MSE_wlm, na.rm= TRUE), sd(QLIKE_wlm, na.rm = TRUE)), 
+    Min = c(min(MSE_wlm, na.rm= TRUE), min(QLIKE_wlm, na.rm = TRUE)),
+    Max = c(max(MSE_wlm, na.rm= TRUE), max(QLIKE_wlm, na.rm = TRUE)))
+    
+    
+    
+   print(summary_wlm)
+    
+  
+
+
+metrics_df <- data.frame(
+  MSE   = MSE_wlm,
+  QLIKE = QLIKE_wlm
+)
+
+plot_mse <- ggplot(metrics_df, aes(y = MSE)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7) +
+  scale_y_log10() +
+  labs(title = "Weighted Linear Regression: MSE",
+       y     = "MSE") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank())
+
+plot_qlike <- ggplot(metrics_df, aes(y = QLIKE)) +
+  geom_boxplot(fill = "coral", alpha = 0.7) +
+  scale_y_log10() +
+  labs(title = "Weighted Linear Regression: QLIKE",
+       y     = "QLIKE") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank())
+
+plot_mse
+plot_qlike
+
+
+co_ef_df <- data.frame(
+  intercept    = sapply(weight_models, function(m) coef(m)[1]),
+  price        = sapply(weight_models, function(m) coef(m)[2]),
+  order        = sapply(weight_models, function(m) coef(m)[3]),
+  BidAskSpread = sapply(weight_models, function(m) coef(m)[4])
+)
+
+
+summary(co_ef_df)
+
+
+cat("Average equation across all Time_IDs:")
+cat("Volatility =", round(mean(co_ef_df$intercept), 6),
+    "+", round(mean(co_ef_df$price), 6), "* price",
+    "+", round(mean(co_ef_df$order), 9), "* order",
+    "+", round(mean(co_ef_df$BidAskSpread), 6), "* BidAskSpread")
+
+
+```
+
+## Model 2 
+```{r}
+#Arma-Garch
+
+spec = ugarchspec(variance.model = list(model = "sGARCH", garchOrder = c(1, 1)), 
+                  mean.model = list(armaOrder = c(1, 1)), 
+                  distribution.model = "norm")
+
+ARMA_GARCH_models = list()
+for (i in 1:500) {
+  ARMA_GARCH_models[[i]] = ugarchfit(spec = spec, 
+                                     data = log_r_stock[[i]] %>% 
+                                       filter(time <= 480) %>% 
+                                       pull(log_return),
+                                      solver = "hybrid")
+}
+
+Real_vol_pred = rep(0, length(vol))
+
+set.seed(111)
+for(i in 1:500) {
+  a_g_spec <- getspec(ARMA_GARCH_models[[i]])
+  setfixed(a_g_spec) <- as.list(coef(ARMA_GARCH_models[[i]]))
+  future_path = fitted(ugarchpath(a_g_spec, n.sim = 30, m.sim = 1000))
+  
+  val_columns <- colSums(is.na(future_path)) <= 5
+  val_paths <- future_path[, val_columns]
+  
+  if (ncol(val_paths) >= 100){
+    
+    row_medians <- apply(val_paths, 1, median, na.rm = TRUE)
+    for (j in 1:nrow(val_paths)) {
+      val_paths[j, is.na(val_paths[j,])] <- row_medians[j]
+    }
+    Real_vol_pred[i] <- mean(sqrt(colSums(val_paths^2)))
+    
+    }
+  else{
+    Real_vol_pred[i] <- NA
+  }
+}
+  
+  
+cat("Successfully predicted: ", sum(!is.na(Real_vol_pred)), "/ 500\n")
+cat("Path unrealiable: ", sum(is.na(Real_vol_pred)), " / 500")
+
+
+real_vol_per_path <- sqrt(colSums(future_path^2, na.rm = TRUE))
+
+ggplot(data.frame(rv = real_vol_per_path), aes(x = rv)) + geom_histogram(fill = "goldenrod", color = "white", bins = 50, alpha = 0.7) + geom_vline(xintercept = mean(real_vol_per_path), color = "pink", linewidth = 1, linetype = "dotted") + annotate("text", x = mean(real_vol_per_path) * 1.05, y = 60, label = paste("Predicted Realised Volatility = ", round(mean(real_vol_per_path), 6)), color = "red") + labs(title = "Distribution of Predicted Volatility", subtitle = "Based on ARMA GARCH Model 1000 simulations", x = "Realised Volatility", y = "Count") + theme_minimal()
+
+
+
+MSE_garch   <- numeric(500)
+QLIKE_garch <- numeric(500)
+
+for (i in 1:500) {
+  
+  if (is.na(Real_vol_pred[i])) next
+  
+  actual <- valid_vol[[i]]$volatility
+  
+
+  pred   <- rep(Real_vol_pred[i], 4)
+  pred[pred <= 0] <- 1e-10
+  
+  MSE_garch[i]   <- mean((actual - pred)^2)
+  QLIKE_garch[i] <- mean(actual/pred - log(actual/pred) - 1)
+}
+
+sum_garch <- data.frame(
+  Metric = c("MSE", "QLIKE"),
+  Median = c(median(MSE_garch,   na.rm = TRUE),
+             median(QLIKE_garch, na.rm = TRUE)),
+  Mean   = c(mean(MSE_garch,   na.rm = TRUE),
+             mean(QLIKE_garch, na.rm = TRUE)),
+  SD     = c(sd(MSE_garch,   na.rm = TRUE),
+             sd(QLIKE_garch, na.rm = TRUE)),
+  Min    = c(min(MSE_garch,   na.rm = TRUE),
+             min(QLIKE_garch, na.rm = TRUE)),
+  Max    = c(max(MSE_garch,   na.rm = TRUE),
+             max(QLIKE_garch, na.rm = TRUE))
+)
+
+cat("ARMA-GARCH RESULTS")
+print(sum_garch)
+
+arm_plot_1 <- ggplot(
+  data.frame(val = MSE_garch[MSE_garch > 0]),
+  aes(y = val)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7) +
+  scale_y_log10() +
+  labs(title = "ARMA-GARCH: MSE",
+       y     = "MSE") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank())
+
+arm_plot_2 <- ggplot(
+  data.frame(val = QLIKE_garch[QLIKE_garch > 0 & 
+                                is.finite(QLIKE_garch)]),
+  aes(y = val)) +
+  geom_boxplot(fill = "coral", alpha = 0.7) +
+  scale_y_log10() +
+  labs(title = "ARMA-GARCH: QLIKE",
+       y     = "QLIKE") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank())
+
+arm_plot_1
+arm_plot_2
+
+print(sum_garch)
+
+```
+only 1 path is unrealiable > as more than 5 within that path were NA > 
+
+From the graph > Our ARMA-GARCH model simulated 1000 possible futures for the next 30 seconds. The most likely realised volatility is around 0.001644. However the distribution shows meaningful uncertainty — there's a right tail suggesting occasional volatility spikes you should account for when pricing options.
+
+pink line > final averaged predicted rv line 
+
+
+
+## Model 3
+```{r}
+#Xgboost model 
+
+set.seed(111)
+
+
+valid_index <- sapply(1:500, function(i) {
+  micro <- predict %>%
+    filter(time_id == Time_IDs[i],
+           time_bucket != 0) %>%
+    group_by(time_bucket) %>%
+    summarise(spread = mean(BidAskSpread),
+              .groups = "drop")
+  nrow(micro) >= 20
+})
+
+
+
+rows_train <- list()
+rows_test <- list()
+
+
+for(i in 1:500){
+  
+  if(!valid_index[i]) next
+  
+  real_vol <- train_vol[[i]]$volatility
+  micro <- predict %>%
+    filter(time_id == Time_IDs[i], time_bucket != 0)%>% 
+    group_by(time_bucket) %>% 
+    summarise(
+      spread = mean(BidAskSpread),
+      .groups = "drop")
+
+cat("Valid time ids", sum(valid_index))  
+  
+  for(t in 6:16){
+    rows_train[[length(rows_train) + 1]] <- data.frame(
+      real_vol_lag1 = real_vol[t-1],
+      real_vol_lag2 = real_vol[t-2],
+      mean_real_vol_5 = mean(real_vol[(t-5):(t-1)]), 
+      sd_real_vol_5 = sd(real_vol[(t-5):(t-1)]), 
+      spread = micro$spread[t], 
+      target = real_vol[t],
+      index = i 
+    )
+  }
+  
+  for(t in 17:20){
+  rows_test[[length(rows_test) + 1]] <- data.frame( 
+    real_vol_lag1 = real_vol[t-1],
+      real_vol_lag2 = real_vol[t-2],
+      mean_real_vol_5 = mean(real_vol[(t-5):(t-1)]), 
+      sd_real_vol_5 = sd(real_vol[(t-5):(t-1)]), 
+      spread = micro$spread[t],  
+      target = NA_real_, 
+      index = i
+    
+    )    
+  }
+}
+  
+   train_df <- bind_rows(rows_train) 
+   test_df <- bind_rows(rows_test)
+    
+   
+   feature  <- c("real_vol_lag1","real_vol_lag2","mean_real_vol_5",
+            "sd_real_vol_5","spread")
+d_train <- xgb.DMatrix(
+  data  = as.matrix(train_df[, feature]),
+  label = train_df$target
+)
+d_test <- xgb.DMatrix(
+  data = as.matrix(test_df[, feature])
+)
+   
+  grid_param <- expand.grid(
+  eta       = c(0.05, 0.1),
+  max_depth = c(3, 4)
+) 
+  
+  cat("Hyperparameter Tunings: ")
+  
+  cross_val_res <- data.frame(
+  eta = numeric(nrow(grid_param)),
+  max_depth    = numeric(nrow(grid_param)),
+  best_nrounds = numeric(nrow(grid_param)),
+  cv_rmse      = numeric(nrow(grid_param)))
+  
+  
+  for(z in 1:nrow(grid_param)) { 
+    cv <- xgb.cv(
+      params = list(
+        objective = "reg:squarederror", 
+        eta = grid_param$eta[z], 
+       max_depth        = grid_param$max_depth[z],
+      subsample        = 0.8,
+      colsample_bytree = 0.8
+    ),
+    data                  = d_train,
+    nrounds               = 500,
+    nfold                 = 5,
+    early_stopping_rounds = 20,
+    verbose               = 0,
+    metrics               = "rmse"
+  )
+  
+     best_n <- ifelse(
+    is.null(cv$best_iteration) || length(cv$best_iteration) == 0,
+    nrow(cv$evaluation_log),
+    cv$best_iteration
+  )
+    
+  cross_val_res[z, ] <- data.frame(
+    eta          = grid_param$eta[z],
+    max_depth    = grid_param$max_depth[z],
+    best_nrounds = best_n, 
+    cv_rmse      = min(cv$evaluation_log$test_rmse_mean)
+  )
+  
+  cat("eta:", grid_param$eta[z],
+      "| depth:", grid_param$max_depth[z],
+      "| trees:", cross_val_res$best_nrounds[z],
+      "| RMSE:", round(cross_val_res$cv_rmse[z], 8), "\n")
+}
+    
+    best_res <- cross_val_res[which.min(cross_val_res$cv_rmse), ]
+cat("BEST PARAMETERS")
+print(best_res)
+    
+
+xgb_fin_md <- xgb.train( 
+  param = list(
+    objective        = "reg:squarederror",
+    eta              = best_res$eta,
+    max_depth        = best_res$max_depth,
+    subsample        = 0.8,
+    colsample_bytree = 0.8
+  ),
+  data    = d_train,
+  nrounds = best_res$best_nrounds,
+  verbose = 0
+)
+
+cat("Final model trained:")
+cat("  eta =      ", best_res$eta,        "\n")
+cat("  max_depth =", best_res$max_depth,  "\n")
+cat("  nrounds =  ", best_res$best_nrounds, "\n")
+  
+  
+import <- xgb.importance( 
+  feature_names = feature, 
+  model = xgb_fin_md) 
+
+cat("FEATURE IMPORTANCE")
+print(import)
+
+xgb.plot.importance(
+  import,
+  main = "XGBoost: Feature Importance",
+  col  = "forestgreen"
+)
+
+#test
+
+test_df$pred <- pmax(predict(xgb_fin_md, d_test), 0)
+
+pred_xgb <- lapply(1:500, function(i) {
+  test_df %>%
+    filter(index == i) %>%
+    pull(pred)
+})
+
+
+cat("Actual vs Predicted (time_id 1):")
+print(data.frame(
+  actual    = valid_vol[[1]]$volatility,
+  predicted = pred_xgb[[1]]
+))
+
+#plot graph 
+
+MSE_xgb  <- numeric(500)
+QLIKE_xgb <- numeric(500)
+
+for (i in 1:500) {
+  actual <- valid_vol[[i]]$volatility
+  pred   <- pred_xgb[[i]]
+  
+  if (length(pred) == 0 || any(is.na(pred))) next
+  
+  pred[pred <= 0] <- 1e-10
+  MSE_xgb[i]     <- mean((actual - pred)^2)
+  QLIKE_xgb[i]   <- mean(actual/pred - log(actual/pred) - 1)
+}
+
+sum_xgb <- data.frame(
+  Metric = c("MSE", "QLIKE"),
+  Median = c(median(MSE_xgb,   na.rm = TRUE),
+             median(QLIKE_xgb, na.rm = TRUE)),
+  Mean   = c(mean(MSE_xgb,   na.rm = TRUE),
+             mean(QLIKE_xgb, na.rm = TRUE)),
+  SD     = c(sd(MSE_xgb,   na.rm = TRUE),
+             sd(QLIKE_xgb, na.rm = TRUE))
+)
+
+cat("XGBOOST RESULTS")
+print(sum_xgb)
+
+  
+plot_1 <- ggplot(
+  data.frame(val = MSE_xgb[MSE_xgb > 0]),
+  aes(y = val)) +
+  geom_boxplot(fill = "pink", alpha = 0.8) +
+  scale_y_log10() +
+  labs(title = "Evaluate XG Boost: MSE",
+       y     = "MSE") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank())
+
+plot_2 <- ggplot(
+  data.frame(val = QLIKE_xgb[QLIKE_xgb > 0]),
+  aes(y = val)) +
+  geom_boxplot(fill = "coral", alpha = 0.7) +
+  scale_y_log10() +
+  labs(title = "Evaluate XG Boost: QLIKE",
+       y     = "QLIKE") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank())
+  
+plot_1 
+plot_2
+
+```
+machine learning model 
+
+
+
+## Evaluation
+```{r}
+final_comparison_table <- data.frame(
+  Model        = c("WLS Regression",
+                   "ARMA GARCH",
+                   "XG Boost"),
+  Median_MSE   = c(median(MSE_wlm,   na.rm = TRUE),
+                   median(MSE_garch, na.rm = TRUE),
+                   median(MSE_xgb,   na.rm = TRUE)),
+  Median_QLIKE = c(median(QLIKE_wlm[is.finite(QLIKE_wlm)],
+                          na.rm = TRUE),
+                   median(QLIKE_garch[is.finite(QLIKE_garch)],
+                          na.rm = TRUE),
+                   median(QLIKE_xgb[is.finite(QLIKE_xgb)],
+                          na.rm = TRUE)),
+P95_QLIKE    = c(quantile(QLIKE_wlm[is.finite(QLIKE_wlm)],   0.95, na.rm = TRUE),
+                   quantile(QLIKE_garch[is.finite(QLIKE_garch)], 0.95, na.rm = TRUE),
+                   quantile(QLIKE_xgb[is.finite(QLIKE_xgb)],    0.95, na.rm = TRUE))
+) %>% arrange(P95_QLIKE)
+
+print(final_comparison_table)
+
+
+all_mse <- data.frame(
+  MSE = c(
+    MSE_wlm[MSE_wlm > 0 & is.finite(MSE_wlm)],
+    MSE_garch[MSE_garch > 0 & is.finite(MSE_garch)],
+    MSE_xgb[MSE_xgb > 0 & is.finite(MSE_xgb)]
+  ),
+  Model = c(
+    rep("WLS Regression",
+        sum(MSE_wlm > 0 & is.finite(MSE_wlm))),
+    rep("ARMA GARCH",
+        sum(MSE_garch > 0 & is.finite(MSE_garch))),
+    rep("XG Boost",
+        sum(MSE_xgb > 0 & is.finite(MSE_xgb)))
+  )
+) %>%
+  mutate(Model = factor(
+    Model,
+    levels = c("WLS Regression",
+               "ARMA GARCH",
+               "XG Boost")
+  ))
+
+plot_mse_all <- ggplot(
+  all_mse,
+  aes(x = Model, y = MSE, fill = Model)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.5) +
+  scale_y_log10() +
+  scale_fill_manual(
+    values = c("steelblue", "pink", "plum")
+  ) +
+  labs(
+    title    = "Model Comparison Using MSE",
+    subtitle = "Lower means better prediction accuracy",
+    x        = "",
+    y        = "MSE"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+plot_mse_all
+
+all_qlike <- data.frame(
+  QLIKE = c(
+    QLIKE_wlm[QLIKE_wlm > 0 & is.finite(QLIKE_wlm)],
+    QLIKE_garch[QLIKE_garch > 0 & is.finite(QLIKE_garch)],
+    QLIKE_xgb[QLIKE_xgb > 0 & is.finite(QLIKE_xgb)]
+  ),
+  Model = c(
+    rep("WLS Regression",
+        sum(QLIKE_wlm > 0 & is.finite(QLIKE_wlm))),
+    rep("ARMA GARCH",
+        sum(QLIKE_garch > 0 & is.finite(QLIKE_garch))),
+    rep("XG Boost",
+        sum(QLIKE_xgb > 0 & is.finite(QLIKE_xgb)))
+  )
+) %>%
+  mutate(Model = factor(
+    Model,
+    levels = c("WLS Regression",
+               "ARMA GARCH",
+               "XG Boost")
+  ))
+
+plot_qlike_all <- ggplot(
+  all_qlike,
+  aes(x = Model, y = QLIKE, fill = Model)) +
+  geom_boxplot(alpha = 0.8) +
+  scale_y_log10() +
+  scale_fill_manual(
+    values = c("palegreen", "peachpuff", "paleturquoise")
+  ) +
+  labs(
+    title    = "Model Comparison Using QLIKE",
+    subtitle = "Lower means the model is better at penalising",
+    x        = "",
+    y        = "QLIKE"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+plot_qlike_all 
+
+
+best_model <- final_comparison_table$Model[1]
+cat("Getting prediction for:", best_model)
+
+best_pred <- switch(best_model,
+  "WLS Regression" = predict_lm,
+  "ARMA GARCH"     = lapply(1:500, function(i) 
+                      rep(Real_vol_pred[i], 4)),
+  "XG Boost"        = pred_xgb
+)
+
+
+best_time <- which.min(sapply(1:500, function(i) {
+  pred <- best_pred[[i]]
+  if (length(pred) == 0 || any(is.na(pred))) return(Inf)
+  mean((valid_vol[[i]]$volatility - pred)^2)
+}))
+
+plot_df <- data.frame(
+  bucket = vol[[best_time]]$time_bucket,
+  actual = vol[[best_time]]$volatility,
+  pred   = c(rep(NA, 16), best_pred[[best_time]])
+)
+
+ggplot(plot_df, aes(x = bucket)) +
+  geom_line(aes(y = actual),
+            colour   = "blue",
+            linewidth = 0.8) +
+  geom_point(aes(y = actual),
+             colour = "blue",
+             size   = 1.5) +
+  geom_point(aes(y = pred),
+             colour  = "orchid",
+             size    = 3,
+             na.rm   = TRUE) +
+  geom_vline(xintercept = 16.5,
+             linetype   = "dashed",
+             colour     = "grey") +
+  annotate("text",
+           x     = 13,
+           y     = max(plot_df$actual, na.rm = TRUE),
+           label = "Training",
+           colour = "grey",
+           size  = 3.5) +
+  annotate("text",
+           x     = 18.5,
+           y     = max(plot_df$actual, na.rm = TRUE),
+           label = "Validation",
+           colour = "orchid",
+           size  = 3.5) +
+  labs(
+    title    = paste(best_model,
+                     ": Actual vs Predicted of best example"),
+    subtitle = "Black = actual | Red = predicted",
+    x        = "30 second bucket",
+    y        = "Realised Volatility"
+  ) +
+  theme_minimal()
+
+```
+
+
